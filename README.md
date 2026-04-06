@@ -1,1 +1,1 @@
-![Doctests](https://github.com/<MiaUrosevic>/<Lab-more-project>/actions/workflows/doctests.yml/badge.svg)
+![Doctests](https://github.com/MiaUrosevic/Lab-more-project/actions/workflows/doctests.yml/badge.svg)
