@@ -9,6 +9,9 @@ This project provides a simple text summarization and chat interface using a moc
 - `docsum.py` – Summarizes text using the LLM class.  
 - `llm.py` – Mock LLM class used for testing and demonstration purposes.  
 
+
+[View this project on PyPI](https://pypi.org/project/cmc-csci40-mia/)
+
 ## Installation
 
 Install via pip:
@@ -16,6 +19,4 @@ Install via pip:
 ```bash
 pip install cmc-csci40-mia
 
-## PyPI
 
-[View this project on PyPI](https://pypi.org/project/cmc-csci40-mia/)
