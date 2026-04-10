@@ -3,7 +3,7 @@
 docsum.py - Simple text summarization using LLM
 
 Doctests:
->>> from docsum_pkg import summarize_text
+>>> from docsum_src import summarize_text
 >>> summarize_text("Python is a programming language used for AI and data science.")  # doctest: +ELLIPSIS
 'Hello from LLM'
 """
