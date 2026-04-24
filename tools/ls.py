@@ -11,12 +11,15 @@ def run_ls(path="."):
     """
     List files in the current folder or a specified relative folder.
 
-    >>> import tempfile
-    >>> with tempfile.TemporaryDirectory() as tmp:
-    ...     open(os.path.join(tmp, "b.txt"), "w").close()
-    ...     open(os.path.join(tmp, "a.txt"), "w").close()
-    ...     run_ls(tmp)
+    >>> import shutil
+    >>> test_dir = "__doctest_ls_tmp__"
+    >>> shutil.rmtree(test_dir, ignore_errors=True)
+    >>> os.makedirs(test_dir)
+    >>> open(os.path.join(test_dir, "b.txt"), "w").close()
+    >>> open(os.path.join(test_dir, "a.txt"), "w").close()
+    >>> run_ls(test_dir)
     'a.txt\\nb.txt'
+    >>> shutil.rmtree(test_dir)
 
     >>> run_ls("..")
     'Error: unsafe path'
