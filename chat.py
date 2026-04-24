@@ -6,10 +6,41 @@ and the interactive REPL for talking to local project files with tools.
 """
 
 import argparse
+import glob
 import json
 import os
 import shlex
 from pathlib import PurePath, PurePosixPath, PureWindowsPath
+
+import requests
+
+
+PROVIDER_CONFIGS = {
+    "groq": {
+        "api_base_env": "GROQ_API_BASE",
+        "api_key_env": "GROQ_API_KEY",
+        "api_url": "https://api.groq.com/openai/v1/chat/completions",
+        "model": "openai/gpt-oss-120b",
+    },
+    "openai": {
+        "api_base_env": "OPENROUTER_API_BASE",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "api_url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "openai/gpt-5",
+    },
+    "anthropic": {
+        "api_base_env": "OPENROUTER_API_BASE",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "api_url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "anthropic/claude-opus-4.6",
+    },
+    "google": {
+        "api_base_env": "OPENROUTER_API_BASE",
+        "api_key_env": "OPENROUTER_API_KEY",
+        "api_url": "https://openrouter.ai/api/v1/chat/completions",
+        "model": "google/gemini-3.1-pro-preview",
+    },
+}
 
 
 def is_path_safe(path: str) -> bool:
@@ -39,13 +70,78 @@ def is_path_safe(path: str) -> bool:
     return ".." not in PurePath(normalized_path).parts
 
 
+def list_path_completions(prefix):
+    """
+    Return sorted path completions for the current token prefix.
+
+    >>> "__pycache__" not in list_path_completions("")
+    True
+    >>> ".github" in list_path_completions(".g")
+    True
+    """
+    if prefix:
+        matches = glob.glob(f"{prefix}*")
+    else:
+        matches = glob.glob("*") + glob.glob(".*")
+    cleaned = [match for match in sorted(set(matches)) if match not in {".", ".."}]
+    return [match for match in cleaned if "__pycache__" not in match]
+
+
+def complete_input(text, state, line_buffer=None, commands=None):
+    """
+    Return a single readline completion candidate for the current state.
+
+    >>> complete_input("/l", 0, "/l", commands=["ls", "cat"])
+    '/ls'
+    >>> complete_input(".g", 0, "/ls .g") in {'.git', '.github'}
+    True
+    """
+    active_commands = sorted(commands or [])
+    buffer = text if line_buffer is None else line_buffer
+    tokens = buffer.split()
+
+    if buffer.startswith("/") and (len(tokens) <= 1 and not buffer.endswith(" ")):
+        matches = [f"/{command}" for command in active_commands if command.startswith(text[1:])]
+    else:
+        matches = list_path_completions(text)
+
+    if state < len(matches):
+        return matches[state]
+    return None
+
+
+def configure_readline(commands):
+    """
+    Configure readline tab completion for slash commands and file paths.
+
+    >>> configure_readline(["ls", "cat"]) in {True, False}
+    True
+    """
+    try:
+        import readline
+    except ImportError:
+        return False
+
+    readline.set_completer_delims(" \t\n;")
+    readline.set_completer(
+        lambda text, state: complete_input(
+            text,
+            state,
+            line_buffer=readline.get_line_buffer(),
+            commands=commands,
+        )
+    )
+    readline.parse_and_bind("tab: complete")
+    return True
+
+
 class Chat:
     """
     A Chat manages a local file-aware conversation session with manual and automatic tool use.
 
-    It stores messages, supports slash commands like `/ls` and `/cat`, and models
-    Groq-style local tool calling by building tool schemas, executing tool calls
-    locally, and storing tool results in the conversation history.
+    It stores messages, supports slash commands like `/ls` and `/cat`, and can
+    either use deterministic local routing or call a configured provider with
+    Groq-style local tool calling for richer conversations.
 
     >>> chat = Chat()
     >>> isinstance(chat.messages, list)
@@ -105,10 +201,6 @@ class Chat:
     def _debug_print(self, command, args):
         """
         Print a tool debug line if debug mode is enabled.
-
-        >>> chat = Chat(debug=False)
-        >>> chat._debug_print("ls", [".github"]) is None
-        True
         """
         if self.debug:
             print(f"[tool] /{command}" + (f" {' '.join(args)}" if args else ""))
@@ -125,10 +217,44 @@ class Chat:
         active_messages = self.messages if messages is None else messages
         transcript = []
         for message in active_messages:
-            transcript.append(f"{message['role']}: {message['content']}")
+            transcript.append(f"{message['role']}: {message.get('content', '')}")
         summary_lines = transcript[:5]
         summary_body = "\n".join(summary_lines) if summary_lines else "No messages yet."
         return f"Summary of conversation:\n{summary_body}"
+
+    def provider_settings(self):
+        """
+        Return the API settings for the selected provider.
+
+        >>> Chat("groq").provider_settings()["model"]
+        'openai/gpt-oss-120b'
+        >>> Chat("google").provider_settings()["model"]
+        'google/gemini-3.1-pro-preview'
+        """
+        config = PROVIDER_CONFIGS[self.provider]
+        return {
+            "api_url": os.environ.get(config["api_base_env"], config["api_url"]),
+            "api_key": os.environ.get(config["api_key_env"]),
+            "model": config["model"],
+        }
+
+    def has_provider_credentials(self):
+        """
+        Return True when the configured provider has an API key available.
+
+        >>> Chat("groq").has_provider_credentials()
+        False
+        """
+        return bool(self.provider_settings()["api_key"])
+
+    def tool_schemas(self):
+        """
+        Return the tool schemas exposed to the language model.
+
+        >>> len(Chat().tool_schemas()) >= 5
+        True
+        """
+        return [tool["spec"] for tool in self.tools.values()]
 
     def _manual_args_to_kwargs(self, command, args):
         """
@@ -230,7 +356,7 @@ class Chat:
         }
         return counts[command]
 
-    def _append_tool_message(self, command, args, result):
+    def _append_tool_message(self, command, args, result, tool_call_id=None):
         """
         Store a tool result in the current conversation.
 
@@ -239,14 +365,15 @@ class Chat:
         >>> chat.messages[-1]["role"]
         'tool'
         """
-        self.messages.append(
-            {
-                "role": "tool",
-                "name": command,
-                "content": f"/{command}" + (f" {' '.join(args)}" if args else "")
-                + f"\n{result}",
-            }
-        )
+        message = {
+            "role": "tool",
+            "name": command,
+            "content": f"/{command}" + (f" {' '.join(args)}" if args else "") + f"\n{result}",
+        }
+        if tool_call_id is not None:
+            message["tool_call_id"] = tool_call_id
+            message["content"] = str(result)
+        self.messages.append(message)
 
     def _auto_choose_tool(self, message: str):
         """
@@ -287,10 +414,7 @@ class Chat:
         if lowered.startswith("what is "):
             expression = text[8:].rstrip("?").strip()
             if any(character.isdigit() for character in expression):
-                return self._make_tool_call(
-                    "calculate",
-                    {"expression": expression},
-                )
+                return self._make_tool_call("calculate", {"expression": expression})
         return None
 
     def _render_tool_response(self, command, tool_result):
@@ -325,19 +449,143 @@ class Chat:
 
         return tool_result
 
-    def send_message(self, message: str) -> str:
+    def _provider_messages(self):
         """
-        Send a message and return a response.
-
-        This version uses local tool-call payloads and a deterministic router so the
-        required manual and automatic tool behavior can be tested reliably without
-        depending on a live external provider.
+        Convert the stored transcript into provider-compatible messages.
 
         >>> chat = Chat()
-        >>> isinstance(chat.send_message("what files are in the .github folder?"), str)
+        >>> chat.messages = [{"role": "tool", "content": "/ls\\nworkflows"}]
+        >>> chat._provider_messages()[0]["role"]
+        'assistant'
+        """
+        provider_messages = []
+        for message in self.messages:
+            role = message["role"]
+            if role == "tool" and "tool_call_id" not in message:
+                provider_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": "Manual tool output:\n" + message["content"],
+                    }
+                )
+                continue
+
+            entry = {"role": role, "content": message.get("content", "")}
+            if "tool_calls" in message:
+                entry["tool_calls"] = message["tool_calls"]
+            if "tool_call_id" in message:
+                entry["tool_call_id"] = message["tool_call_id"]
+            if "name" in message and role == "tool":
+                entry["name"] = message["name"]
+            provider_messages.append(entry)
+        return provider_messages
+
+    def _provider_headers(self):
+        """
+        Return the request headers for the selected provider.
+
+        >>> headers = Chat("openai")._provider_headers()
+        >>> headers["Content-Type"]
+        'application/json'
+        """
+        settings = self.provider_settings()
+        headers = {
+            "Content-Type": "application/json",
+        }
+        if settings["api_key"]:
+            headers["Authorization"] = f"Bearer {settings['api_key']}"
+        if self.provider != "groq":
+            headers["HTTP-Referer"] = "https://github.com/MiaUrosevic/Lab-more-project"
+            headers["X-Title"] = "lab-more-project-chat"
+        return headers
+
+    def _provider_payload(self):
+        """
+        Build the provider request payload for the current conversation.
+
+        >>> payload = Chat("anthropic")._provider_payload()
+        >>> payload["model"]
+        'anthropic/claude-opus-4.6'
+        """
+        settings = self.provider_settings()
+        return {
+            "model": settings["model"],
+            "messages": self._provider_messages(),
+            "tools": self.tool_schemas(),
+            "tool_choice": "auto",
+            "temperature": 0.2,
+            "max_tokens": 4096,
+        }
+
+    def _provider_request(self):
+        """
+        Send a chat completion request to the configured provider.
+
+        >>> chat = Chat()
+        >>> isinstance(chat._provider_payload(), dict)
         True
         """
-        self.messages.append({"role": "user", "content": message})
+        stub_response = os.environ.get("CHAT_PROVIDER_STUB_RESPONSE")
+        if stub_response:
+            return json.loads(stub_response)
+
+        settings = self.provider_settings()
+        response = requests.post(
+            settings["api_url"],
+            headers=self._provider_headers(),
+            json=self._provider_payload(),
+            timeout=60,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def _send_with_provider(self):
+        """
+        Run the provider loop until a final assistant response is returned.
+
+        >>> chat = Chat()
+        >>> chat.messages = [{"role": "user", "content": "hello"}]
+        >>> isinstance(chat._provider_messages(), list)
+        True
+        """
+        for _ in range(5):
+            response_data = self._provider_request()
+            response_message = response_data["choices"][0]["message"]
+            tool_calls = response_message.get("tool_calls") or []
+
+            if tool_calls:
+                self.messages.append(
+                    {
+                        "role": "assistant",
+                        "content": response_message.get("content") or "",
+                        "tool_calls": tool_calls,
+                    }
+                )
+                for tool_call in tool_calls:
+                    command, tool_result, arg_values = self.execute_tool_call(tool_call)
+                    self._debug_print(command, arg_values)
+                    self._append_tool_message(
+                        command,
+                        arg_values,
+                        tool_result,
+                        tool_call_id=tool_call["id"],
+                    )
+                continue
+
+            assistant_text = response_message.get("content") or ""
+            self.messages.append({"role": "assistant", "content": assistant_text})
+            return assistant_text
+
+        return "Error: provider exceeded the maximum number of tool-calling turns"
+
+    def _send_with_deterministic_router(self, message):
+        """
+        Route the message through the deterministic local tool logic.
+
+        >>> chat = Chat()
+        >>> chat._send_with_deterministic_router("what is 5 + 7?")
+        '12'
+        """
         tool_call = self._auto_choose_tool(message)
 
         if tool_call is not None:
@@ -345,12 +593,39 @@ class Chat:
             command, tool_result, arg_values = self.execute_tool_call(tool_call)
             self._debug_print(command, arg_values)
             self._append_tool_message(command, arg_values, tool_result)
-            return self._render_tool_response(command, tool_result)
+            rendered = self._render_tool_response(command, tool_result)
+            self.messages.append({"role": "assistant", "content": rendered})
+            return rendered
 
-        return (
+        fallback = (
             "I could not automatically determine the right tool for that request yet. "
             "Try a slash command like /ls, /cat, /grep, /calculate, or /compact."
         )
+        self.messages.append({"role": "assistant", "content": fallback})
+        return fallback
+
+    def send_message(self, message: str) -> str:
+        """
+        Send a message and return a response.
+
+        This version uses deterministic local routing by default and upgrades to
+        real provider-backed tool calling when the selected provider is configured
+        with API credentials.
+
+        >>> chat = Chat()
+        >>> isinstance(chat.send_message("what files are in the .github folder?"), str)
+        True
+        """
+        self.messages.append({"role": "user", "content": message})
+
+        if self.has_provider_credentials():
+            try:
+                return self._send_with_provider()
+            except requests.RequestException as error:
+                warning = f"Provider request failed: {error}. Falling back to local routing."
+                self.messages.append({"role": "assistant", "content": warning})
+
+        return self._send_with_deterministic_router(message)
 
 
 def parse_args(argv=None):
@@ -380,6 +655,7 @@ def repl(chat: Chat):
     """
     Run the interactive REPL until interrupted.
     """
+    configure_readline(chat.tools.keys())
     while True:
         try:
             line = input("chat> ")

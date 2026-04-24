@@ -1,5 +1,7 @@
 """Integration tests for the CLI and real project directories."""
 
+import json
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -47,6 +49,36 @@ def test_cli_provider_runs():
     )
     assert result.returncode == 0
     assert result.stdout.strip() == "4"
+
+
+def test_cli_openai_provider_stub():
+    """Use the provider code path in a subprocess with a stubbed API response."""
+    env = {
+        **os.environ,
+        "OPENROUTER_API_KEY": "test-token",
+        "CHAT_PROVIDER_STUB_RESPONSE": json.dumps(
+            {
+                "choices": [
+                    {
+                        "message": {
+                            "content": "Stub provider response.",
+                        }
+                    }
+                ]
+            }
+        ),
+    }
+    result = subprocess.run(
+        [sys.executable, str(CHAT_SCRIPT), "--provider", "openai", "tell me about this repo"],
+        capture_output=True,
+        text=True,
+        cwd=REPO_ROOT,
+        env=env,
+        check=False,
+    )
+
+    assert result.returncode == 0
+    assert result.stdout.strip() == "Stub provider response."
 
 
 def test_repl_manual_command_runs():

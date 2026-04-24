@@ -1,9 +1,10 @@
 """Unit tests for chat session behavior and command routing."""
 
 import json
-from unittest.mock import patch
+import os
+from unittest.mock import Mock, patch
 
-from chat import Chat, is_path_safe, main, repl
+from chat import Chat, complete_input, configure_readline, is_path_safe, main, repl
 
 
 def test_is_path_safe():
@@ -13,6 +14,98 @@ def test_is_path_safe():
     assert is_path_safe("../x") is False
     assert is_path_safe("a/../b.txt") is False
     assert is_path_safe(r"C:\Windows\System32") is False
+
+
+def test_complete_input_command():
+    """Complete slash commands by prefix."""
+    assert complete_input("/l", 0, "/l", commands=["ls", "cat"]) == "/ls"
+
+
+def test_complete_input_path():
+    """Complete file paths in slash-command arguments."""
+    assert complete_input(".g", 0, "/ls .g") in {".git", ".github"}
+
+
+def test_configure_readline():
+    """Configure readline without failing on supported platforms."""
+    assert configure_readline(["ls", "cat"]) in {True, False}
+
+
+def test_provider_settings():
+    """Choose the expected model for each provider."""
+    assert Chat("groq").provider_settings()["model"] == "openai/gpt-oss-120b"
+    assert Chat("openai").provider_settings()["model"] == "openai/gpt-5"
+    assert Chat("anthropic").provider_settings()["model"] == "anthropic/claude-opus-4.6"
+    assert Chat("google").provider_settings()["model"] == "google/gemini-3.1-pro-preview"
+
+
+def test_has_provider_credentials():
+    """Read provider credentials from the environment."""
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "token"}, clear=False):
+        assert Chat("openai").has_provider_credentials() is True
+
+
+def test_provider_payload():
+    """Build an OpenAI-compatible provider payload with tools."""
+    chat = Chat("openai")
+    chat.messages = [{"role": "user", "content": "hello"}]
+    payload = chat._provider_payload()
+    assert payload["model"] == "openai/gpt-5"
+    assert payload["tools"]
+    assert payload["messages"][0]["content"] == "hello"
+
+
+def test_provider_request():
+    """Send provider requests with the configured model and headers."""
+    fake_response = Mock()
+    fake_response.json.return_value = {"choices": [{"message": {"content": "hi"}}]}
+    fake_response.raise_for_status.return_value = None
+
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "token"}, clear=False):
+        with patch("chat.requests.post", return_value=fake_response) as post_mock:
+            chat = Chat("openai")
+            chat.messages = [{"role": "user", "content": "hello"}]
+            assert chat._provider_request()["choices"][0]["message"]["content"] == "hi"
+            called_kwargs = post_mock.call_args.kwargs
+            assert called_kwargs["json"]["model"] == "openai/gpt-5"
+            assert called_kwargs["headers"]["Authorization"] == "Bearer token"
+
+
+def test_provider_send_with_tool_call():
+    """Execute local tools when the provider requests them."""
+    tool_response = Mock()
+    tool_response.json.return_value = {
+        "choices": [
+            {
+                "message": {
+                    "tool_calls": [
+                        {
+                            "id": "call_calc",
+                            "type": "function",
+                            "function": {
+                                "name": "calculate",
+                                "arguments": "{\"expression\": \"2 + 2\"}",
+                            },
+                        }
+                    ]
+                }
+            }
+        ]
+    }
+    tool_response.raise_for_status.return_value = None
+
+    final_response = Mock()
+    final_response.json.return_value = {
+        "choices": [{"message": {"content": "The answer is 4."}}]
+    }
+    final_response.raise_for_status.return_value = None
+
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "token"}, clear=False):
+        with patch("chat.requests.post", side_effect=[tool_response, final_response]):
+            chat = Chat("openai")
+            result = chat.send_message("what is 2 + 2?")
+    assert result == "The answer is 4."
+    assert any(message["role"] == "tool" for message in chat.messages)
 
 
 def test_execute_tool_call():
