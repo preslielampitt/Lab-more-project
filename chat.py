@@ -144,8 +144,8 @@ class Chat:
     Groq-style local tool calling for richer conversations.
 
     >>> chat = Chat()
-    >>> isinstance(chat.messages, list)
-    True
+    >>> chat.messages
+    []
     >>> sorted(chat.tools.keys())
     ['calculate', 'cat', 'compact', 'grep', 'ls']
     >>> chat._auto_choose_tool("what is 2 + 2?")["function"]["name"]
@@ -314,7 +314,7 @@ class Chat:
         Execute a slash command directly without calling the model.
 
         >>> chat = Chat()
-        >>> isinstance(chat.run_manual_command("/ls"), str)
+        >>> "chat.py" in chat.run_manual_command("/ls")
         True
         >>> chat.run_manual_command("/doesnotexist")
         "Error: unknown command 'doesnotexist'"
@@ -384,6 +384,9 @@ class Chat:
         'ls'
         >>> chat._auto_choose_tool("show me README.md")["function"]["name"]
         'cat'
+        >>> tool_call = chat._auto_choose_tool("what does the README say this project is about?")
+        >>> tool_call["function"]["name"]
+        'cat'
         >>> chat._auto_choose_tool("find def in tools/*.py")["function"]["name"]
         'grep'
         >>> chat._auto_choose_tool("what is 2 + 2?")["function"]["name"]
@@ -402,6 +405,9 @@ class Chat:
         if lowered.startswith("show me ") or lowered.startswith("open "):
             filename = text.split(maxsplit=2)[-1].strip()
             return self._make_tool_call("cat", {"path": filename})
+
+        if "readme" in lowered:
+            return self._make_tool_call("cat", {"path": "README.md"})
 
         if lowered.startswith("find ") and " in " in text:
             body = text[5:]
@@ -455,8 +461,8 @@ class Chat:
 
         >>> chat = Chat()
         >>> chat.messages = [{"role": "tool", "content": "/ls\\nworkflows"}]
-        >>> chat._provider_messages()[0]["role"]
-        'assistant'
+        >>> chat._provider_messages()
+        [{'role': 'assistant', 'content': 'Manual tool output:\\n/ls\\nworkflows'}]
         """
         provider_messages = []
         for message in self.messages:
@@ -522,8 +528,8 @@ class Chat:
         Send a chat completion request to the configured provider.
 
         >>> chat = Chat()
-        >>> isinstance(chat._provider_payload(), dict)
-        True
+        >>> chat._provider_payload()["tool_choice"]
+        'auto'
         """
         stub_response = os.environ.get("CHAT_PROVIDER_STUB_RESPONSE")
         if stub_response:
@@ -545,8 +551,8 @@ class Chat:
 
         >>> chat = Chat()
         >>> chat.messages = [{"role": "user", "content": "hello"}]
-        >>> isinstance(chat._provider_messages(), list)
-        True
+        >>> chat._provider_messages()
+        [{'role': 'user', 'content': 'hello'}]
         """
         for _ in range(5):
             response_data = self._provider_request()
@@ -613,8 +619,8 @@ class Chat:
         with API credentials.
 
         >>> chat = Chat()
-        >>> isinstance(chat.send_message("what files are in the .github folder?"), str)
-        True
+        >>> chat.send_message("what files are in the .github folder?")
+        'The only file in that folder is workflows.'
         """
         self.messages.append({"role": "user", "content": message})
 
